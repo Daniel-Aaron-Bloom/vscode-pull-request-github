@@ -367,6 +367,12 @@ export class PRContext {
 	public checkFilesExist = (files: string[]): Promise<Record<string, boolean>> =>
 		this.postMessage({ command: 'pr.check-files-exist', args: files });
 
+	public getFilePathHashMap = (): Promise<Record<string, string>> =>
+		this.postMessage({ command: 'pr.get-file-path-hash-map' });
+
+	public openDiffFromLink = (file: string, startLine: number, endLine: number) =>
+		this.postMessage({ command: 'pr.open-diff-from-link', args: { file, startLine, endLine } });
+
 	public viewCheckLogs = (status: PullRequestCheckStatus) => this.postMessage({ command: 'pr.view-check-logs', args: { status } });
 
 	public openCommitChanges = async (commitSha: string) => {

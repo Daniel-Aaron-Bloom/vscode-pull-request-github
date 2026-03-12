@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { OpenCommitChangesArgs } from '../../common/views';
 import { openPullRequestOnGitHub } from '../commands';
@@ -535,6 +536,10 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 				return this.cancelGenerateDescription();
 			case 'pr.change-base-branch':
 				return this.changeBaseBranch(message);
+			case 'pr.get-file-path-hash-map':
+				return this.getFilePathHashMap(message);
+			case 'pr.open-diff-from-link':
+				return this.openDiffFromLink(message);
 		}
 	}
 
@@ -635,6 +640,50 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			return PullRequestModel.openDiffFromComment(this._folderRepositoryManager, this._item, comment);
 		} catch (e) {
 			Logger.error(`Open diff view failed: ${formatError(e)}`, PullRequestOverviewPanel.ID);
+		}
+	}
+
+	private async getFilePathHashMap(message: IRequestMessage<void>): Promise<void> {
+		try {
+			const fileChanges = await this._item.getFileChangesInfo();
+			const hashMap: Record<string, string> = {};
+
+			fileChanges.forEach(file => {
+				const hash = crypto.createHash('sha256').update(file.fileName).digest('hex');
+				hashMap[`diff-${hash}`] = file.fileName;
+			});
+
+			return this._replyMessage(message, hashMap);
+		} catch (e) {
+			Logger.error(`Get file path hash map failed: ${formatError(e)}`, PullRequestOverviewPanel.ID);
+			return this._replyMessage(message, {});
+		}
+	}
+
+	private async openDiffFromLink(message: IRequestMessage<{ file: string; startLine: number; endLine: number }>): Promise<void> {
+		try {
+			const { file, startLine } = message.args;
+			const fileChanges = await this._item.getFileChangesInfo();
+			const change = fileChanges.find(
+				fileChange => fileChange.fileName === file || fileChange.previousFileName === file,
+			);
+
+			if (!change) {
+				Logger.warn(`Could not find file ${file} in PR changes`, PullRequestOverviewPanel.ID);
+				return;
+			}
+
+			const pathSegments = file.split('/');
+			// GitHub line numbers are 1-indexed, VSCode selection API is 0-indexed
+			return PullRequestModel.openDiff(
+				this._folderRepositoryManager,
+				this._item,
+				change,
+				pathSegments[pathSegments.length - 1],
+				startLine - 1,
+			);
+		} catch (e) {
+			Logger.error(`Open diff from link failed: ${formatError(e)}`, PullRequestOverviewPanel.ID);
 		}
 	}
 

@@ -11,28 +11,34 @@ import { PullRequest } from '../../src/github/views';
 import { COMMENT_TEXTAREA_ID } from '../common/constants';
 import PullRequestContext from '../common/context';
 
-const PROCESSED_MARKER = 'data-permalink-processed';
+const LOCALIZED_MARKER = 'data-link-localized';
 
-interface PermalinkAnchor {
+interface LocalizableAnchor {
 	element: HTMLAnchorElement;
 	url: string;
 	file: string;
 	startLine: number;
 	endLine: number;
+	type: 'blob' | 'diff';
+	diffHash?: string;
 }
 
-function findUnprocessedPermalinks(
+function findUnlocalizedAnchors(
 	root: Document | Element,
 	repoName: string,
-): PermalinkAnchor[] {
-	const anchors: PermalinkAnchor[] = [];
+	prNumber?: number,
+): LocalizableAnchor[] {
+	const anchors: LocalizableAnchor[] = [];
 	const urlPattern = new RegExp(
 		`^https://github\\.com/[^/]+/${repoName}/blob/[0-9a-f]{40}/([^#]+)#L([0-9]+)(?:-L([0-9]+))?$`,
 	);
+	const diffUrlPattern = prNumber !== undefined && new RegExp(
+		`^https://github\\.com/[^/]+/${repoName}/pull/${prNumber}/(?:files|changes)#diff-([a-f0-9]{64})(?:R(\\d+)(?:-R(\\d+))?)?$`,
+	);
 
-	// Find all unprocessed anchor elements
+	// Find all unlocalized anchor elements
 	const allAnchors = root.querySelectorAll(
-		`a[href^="https://github.com/"]:not([${PROCESSED_MARKER}])`,
+		`a[href^="https://github.com/"]:not([${LOCALIZED_MARKER}])`,
 	);
 
 	allAnchors.forEach((anchor: Element) => {
@@ -41,11 +47,12 @@ function findUnprocessedPermalinks(
 		const href = htmlAnchor.getAttribute('href');
 		if (!href) return;
 
-		const match = href.match(urlPattern);
-		if (match) {
-			const file = match[1];
-			const startLine = parseInt(match[2]);
-			const endLine = match[3] ? parseInt(match[3]) : startLine;
+		// Try blob permalink pattern first
+		const blobMatch = href.match(urlPattern);
+		if (blobMatch) {
+			const file = blobMatch[1];
+			const startLine = parseInt(blobMatch[2]);
+			const endLine = blobMatch[3] ? parseInt(blobMatch[3]) : startLine;
 
 			anchors.push({
 				element: htmlAnchor,
@@ -53,6 +60,26 @@ function findUnprocessedPermalinks(
 				file,
 				startLine,
 				endLine,
+				type: 'blob',
+			});
+			return;
+		}
+
+		// Try diff link pattern (only if we have a PR number)
+		const diffMatch = diffUrlPattern && href.match(diffUrlPattern);
+		if (diffMatch) {
+			const diffHash = diffMatch[1];
+			const startLine = diffMatch[2] ? parseInt(diffMatch[2]) : 1;
+			const endLine = diffMatch[3] ? parseInt(diffMatch[3]) : startLine;
+
+			anchors.push({
+				element: htmlAnchor,
+				url: href,
+				file: '', // Will be resolved later via hash mapping
+				startLine,
+				endLine,
+				type: 'diff',
+				diffHash,
 			});
 		}
 	});
@@ -61,25 +88,43 @@ function findUnprocessedPermalinks(
 }
 
 
-function updatePermalinks(
-	anchors: PermalinkAnchor[],
+function localizeAnchors(
+	anchors: LocalizableAnchor[],
 	fileExistenceMap: Record<string, boolean>,
+	hashMap?: Record<string, string>,
 ): void {
-	anchors.forEach(({ element, url, file, startLine, endLine }) => {
-		const exists = fileExistenceMap[file];
-		if (!exists) {
-			return;
+	anchors.forEach(({ element, url, file, startLine, endLine, type, diffHash }) => {
+		let resolvedFile = file;
+
+		// For diff links, resolve the file path from the hash
+		if (type === 'diff' && diffHash && hashMap) {
+			const hashKey = `diff-${diffHash}`;
+			resolvedFile = hashMap[hashKey];
+			if (!resolvedFile) {
+				// Hash not found in mapping - file may not exist in this PR
+				return;
+			}
 		}
 
-		element.setAttribute('data-local-file', file);
+		// For blob permalinks, check file existence
+		if (type === 'blob') {
+			const exists = fileExistenceMap[resolvedFile];
+			if (!exists) {
+				return;
+			}
+		}
+
+		// Set data attributes for the click handler
+		element.setAttribute('data-local-file', resolvedFile);
 		element.setAttribute('data-start-line', startLine.toString());
 		element.setAttribute('data-end-line', endLine.toString());
+		element.setAttribute('data-link-type', type);
 
 		// Add "(view on GitHub)" link after this anchor
 		const githubLink = document.createElement('a');
 		githubLink.href = url;
 		githubLink.textContent = 'view on GitHub';
-		githubLink.setAttribute(PROCESSED_MARKER, 'true');
+		githubLink.setAttribute(LOCALIZED_MARKER, 'true');
 		if (element.className) {
 			githubLink.className = element.className;
 		}
@@ -129,11 +174,18 @@ export function Root({ children }) {
 				const file = anchor.getAttribute('data-local-file');
 				const startLine = anchor.getAttribute('data-start-line');
 				const endLine = anchor.getAttribute('data-end-line');
+				const linkType = anchor.getAttribute('data-link-type');
 				if (file && startLine && endLine) {
-					// Swallow the event and open the file
+					// Swallow the event
 					event.preventDefault();
 					event.stopPropagation();
-					ctx.openLocalFile(file, parseInt(startLine), parseInt(endLine));
+
+					// Open diff view for diff links, local file for blob permalinks
+					if (linkType === 'diff') {
+						ctx.openDiffFromLink(file, parseInt(startLine), parseInt(endLine));
+					} else {
+						ctx.openLocalFile(file, parseInt(startLine), parseInt(endLine));
+					}
 				}
 			}
 		};
@@ -142,24 +194,37 @@ export function Root({ children }) {
 		return () => document.removeEventListener('click', handleLinkClick, true);
 	}, [ctx]);
 
-	// Process GitHub permalinks
+	// Process GitHub links
 	useEffect(() => {
 		if (!pr) return;
 
-		const processPermalinks = debounce(async () => {
+		const processAnchors = debounce(async () => {
 			try {
-				const anchors = findUnprocessedPermalinks(document.body, pr.repo);
+				const anchors = findUnlocalizedAnchors(document.body, pr.repo, pr.number);
 				anchors.forEach(({ element }) => {
-					element.setAttribute(PROCESSED_MARKER, 'true');
+					element.setAttribute(LOCALIZED_MARKER, 'true');
 				});
 
 				if (anchors.length > 0) {
-					const uniqueFiles = Array.from(new Set(anchors.map((a) => a.file)));
-					const fileExistenceMap = await ctx.checkFilesExist(uniqueFiles);
-					updatePermalinks(anchors, fileExistenceMap);
+					// Separate blob and diff anchors
+					const blobAnchors = anchors.filter((a) => a.type === 'blob');
+					const diffAnchors = anchors.filter((a) => a.type === 'diff');
+
+					// Localize blob permalinks
+					if (blobAnchors.length > 0) {
+						const uniqueFiles = Array.from(new Set(blobAnchors.map((a) => a.file)));
+						const fileExistenceMap = await ctx.checkFilesExist(uniqueFiles);
+						localizeAnchors(blobAnchors, fileExistenceMap);
+					}
+
+					// Localize diff links
+					if (diffAnchors.length > 0) {
+						const hashMap = await ctx.getFilePathHashMap();
+						localizeAnchors(diffAnchors, {}, hashMap);
+					}
 				}
 			} catch (error) {
-				console.error('Error processing permalinks:', error);
+				console.error('Error processing links:', error);
 			}
 		}, 100);
 
@@ -170,7 +235,7 @@ export function Root({ children }) {
 			);
 
 			if (hasNewNodes) {
-				processPermalinks();
+				processAnchors();
 			}
 		});
 		observer.observe(document.body, {
@@ -179,11 +244,11 @@ export function Root({ children }) {
 		});
 
 		// Process the initial set of links
-		processPermalinks();
+		processAnchors();
 
 		return () => {
 			observer.disconnect();
-			processPermalinks.clear();
+			processAnchors.clear();
 		};
 	}, [pr, ctx]);
 
