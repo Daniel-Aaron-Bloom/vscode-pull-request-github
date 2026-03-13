@@ -27,7 +27,7 @@ import { IssueOverviewPanel, panelKey } from './issueOverview';
 import { isCopilotOnMyBehalf, PullRequestModel } from './pullRequestModel';
 import { PullRequestReviewCommon, ReviewContext } from './pullRequestReviewCommon';
 import { branchPicks, pickEmail, reviewersQuickPick } from './quickPicks';
-import { parseReviewers } from './utils';
+import { parseReviewers, processDiffLinks, processPermalinks } from './utils';
 import { CancelCodingAgentReply, ChangeBaseReply, ChangeReviewersReply, DeleteReviewResult, MergeArguments, MergeResult, PullRequest, ReadyForReviewAndMergeContext, ReadyForReviewContext, ReviewCommentContext, ReviewType, UnresolvedIdentity } from './views';
 import { debounce } from '../common/async';
 import { COPILOT_ACCOUNTS, IComment } from '../common/comment';
@@ -234,6 +234,38 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 		}
 	}
 
+	/**
+	 * Override to process permalinks with PR-specific logic (including diff links).
+	 * Returns undefined if bodyHTML is undefined.
+	 */
+	protected override async processLinksInBodyHtml(bodyHTML: string | undefined): Promise<string | undefined> {
+		if (!bodyHTML) {
+			return bodyHTML;
+		}
+		// Check cache first, otherwise fetch raw file changes
+		const rawFileChanges = this._item.rawFileChanges ?? await this._item.getRawFileChangesInfo();
+
+		// Create hash-to-filename mapping for diff links
+		const hashMap: Record<string, string> = {};
+		rawFileChanges.forEach(file => {
+			const hash = crypto.createHash('sha256').update(file.filename).digest('hex');
+			hashMap[hash] = file.filename;
+		});
+
+		let result = await processPermalinks(
+			bodyHTML,
+			this._item.githubRepository,
+			this._item.githubRepository.rootUri
+		);
+		result = await processDiffLinks(
+			result,
+			this._item.githubRepository,
+			hashMap,
+			this._item.number
+		);
+		return result;
+	}
+
 	protected override onDidChangeViewState(e: vscode.WebviewPanelOnDidChangeViewStateEvent): void {
 		super.onDidChangeViewState(e);
 		this.setVisibilityContext();
@@ -371,6 +403,9 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			this._assignableUsers = assignableUsers;
 			this.setPanelTitle(this.buildPanelTitle(pullRequestModel.number, pullRequestModel.title));
 
+			// Process permalinks in bodyHTML before sending to webview
+			pullRequest.bodyHTML = await this.processLinksInBodyHtml(pullRequest.bodyHTML);
+
 			const isCurrentlyCheckedOut = pullRequestModel.equals(this._folderRepositoryManager.activePullRequest);
 			const mergeMethodsAvailability = repositoryAccess!.mergeMethodsAvailability;
 
@@ -384,7 +419,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			const users = this._assignableUsers[pullRequestModel.remote.remoteName] ?? [];
 			const copilotUser = users.find(user => COPILOT_ACCOUNTS[user.login]);
 			const isCopilotAlreadyReviewer = this._existingReviewers.some(reviewer => !isITeam(reviewer.reviewer) && reviewer.reviewer.login === COPILOT_REVIEWER);
-			const baseContext = this.getInitializeContext(currentUser, pullRequest, timelineEvents, repositoryAccess, viewerCanEdit, users);
+			const baseContext = this.getInitializeContext(currentUser, pullRequest, await this.processTimelineEvents(timelineEvents), repositoryAccess, viewerCanEdit, users);
 
 			this.preLoadInfoNotRequiredForOverview(pullRequest);
 
@@ -536,8 +571,6 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 				return this.cancelGenerateDescription();
 			case 'pr.change-base-branch':
 				return this.changeBaseBranch(message);
-			case 'pr.get-file-path-hash-map':
-				return this.getFilePathHashMap(message);
 			case 'pr.open-diff-from-link':
 				return this.openDiffFromLink(message);
 		}
@@ -640,23 +673,6 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 			return PullRequestModel.openDiffFromComment(this._folderRepositoryManager, this._item, comment);
 		} catch (e) {
 			Logger.error(`Open diff view failed: ${formatError(e)}`, PullRequestOverviewPanel.ID);
-		}
-	}
-
-	private async getFilePathHashMap(message: IRequestMessage<void>): Promise<void> {
-		try {
-			const fileChanges = await this._item.getFileChangesInfo();
-			const hashMap: Record<string, string> = {};
-
-			fileChanges.forEach(file => {
-				const hash = crypto.createHash('sha256').update(file.fileName).digest('hex');
-				hashMap[`diff-${hash}`] = file.fileName;
-			});
-
-			return this._replyMessage(message, hashMap);
-		} catch (e) {
-			Logger.error(`Get file path hash map failed: ${formatError(e)}`, PullRequestOverviewPanel.ID);
-			return this._replyMessage(message, {});
 		}
 	}
 
@@ -777,7 +793,7 @@ export class PullRequestOverviewPanel extends IssueOverviewPanel<PullRequestMode
 				await this._item.unresolveReviewThread(message.args.threadId);
 			}
 			const timelineEvents = await this._getTimeline();
-			this._replyMessage(message, timelineEvents);
+			this._replyMessage(message, await this.processTimelineEvents(timelineEvents));
 		} catch (e) {
 			vscode.window.showErrorMessage(e);
 			this._replyMessage(message, undefined);
